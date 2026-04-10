@@ -320,7 +320,7 @@ def _scrape_assouline(url, region):
 
             products.append([region, title, subtitle, price, product_id, product_url])
 
-        if page > 15:
+        if page > 50:
             break
         page += 1
         time.sleep(1)
@@ -405,7 +405,7 @@ def _scrape_gestalten(url, region):
                 products.append([region, title, subtitle, price, product_url])
                 found_on_page += 1
 
-        if found_on_page == 0 or page > 15:
+        if found_on_page == 0 or page > 50:
             break
         page += 1
         time.sleep(1)
