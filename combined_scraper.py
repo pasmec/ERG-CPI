@@ -1,8 +1,10 @@
 import asyncio
+import os
 import re
 import csv
 import time
 import requests
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from bs4 import BeautifulSoup
 import pandas as pd
@@ -12,7 +14,10 @@ from playwright.async_api import async_playwright
 #  TIMESTAMP — set once at the start of each run
 # ============================================================
 
-RUN_TIMESTAMP = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+_now = datetime.now()
+RUN_TIMESTAMP    = _now.strftime("%Y-%m-%d %H:%M:%S")   # human-readable (for CSV cells)
+RUN_TIMESTAMP_FS = _now.strftime("%Y-%m-%d_%H-%M-%S")   # filesystem-safe (for folder/filenames)
+OUTPUT_DIR       = RUN_TIMESTAMP_FS                      # all output goes here
 
 
 # ============================================================
@@ -99,7 +104,8 @@ async def run_erg():
             info["ISBN"] = await _erg_get_isbn(context, info["Link"])
 
         # Save per-website CSV (original format + Scraped At)
-        with open('erg_media_prices.csv', mode='w', newline='', encoding='utf-8') as file:
+        out_path = os.path.join(OUTPUT_DIR, f"{RUN_TIMESTAMP_FS}_erg_media_prices.csv")
+        with open(out_path, mode='w', newline='', encoding='utf-8') as file:
             writer = csv.writer(file)
             writer.writerow(["Produktname", "ISBN", "EUR", "USD", "JPY", "GBP", "Webseite", "Scraped At"])
             for name, info in final_data.items():
@@ -115,7 +121,7 @@ async def run_erg():
                     RUN_TIMESTAMP
                 ])
 
-        print("\nFertig! Die Daten wurden in 'erg_media_prices.csv' gespeichert.")
+        print(f"\nFertig! Die Daten wurden in '{out_path}' gespeichert.")
         await browser.close()
 
     # Build normalized rows for total CSV
@@ -250,8 +256,8 @@ async def run_taschen():
         df = pd.DataFrame(all_data, columns=["Region", "Title", "Price", "Product-ID", "Product-URL"])
         df = df.drop_duplicates(subset=["Region", "Product-ID", "Product-URL"])
         df["Scraped At"] = RUN_TIMESTAMP
-        df.to_csv("taschen_preise.csv", index=False, encoding="utf-8-sig")
-        print("\nFertig! Datei 'taschen_preise.csv' wurde erstellt.")
+        df.to_csv(os.path.join(OUTPUT_DIR, f"{RUN_TIMESTAMP_FS}_taschen_preise.csv"), index=False, encoding="utf-8-sig")
+        print(f"\nFertig! Datei '{RUN_TIMESTAMP_FS}_taschen_preise.csv' wurde erstellt.")
     else:
         print("\n[!] Keine Daten gefunden.")
 
@@ -340,8 +346,8 @@ def run_assouline():
     df = pd.DataFrame(all_data, columns=["Region", "Titel", "Subtitle/Author", "Preis", "Product-ID", "Product-URL"])
     df = df.drop_duplicates(subset=["Region", "Product-ID", "Product-URL"])
     df["Scraped At"] = RUN_TIMESTAMP
-    df.to_csv("assouline2_preise.csv", index=False, encoding="utf-8-sig")
-    print("Fertig! Datei 'assouline2_preise.csv' wurde erstellt.")
+    df.to_csv(os.path.join(OUTPUT_DIR, f"{RUN_TIMESTAMP_FS}_assouline2_preise.csv"), index=False, encoding="utf-8-sig")
+    print(f"Fertig! Datei '{RUN_TIMESTAMP_FS}_assouline2_preise.csv' wurde erstellt.")
 
     region_map = {"IT": "Italy", "GB": "UK", "US": "US", "JP": "Japan"}
     rows = []
@@ -424,8 +430,8 @@ def run_gestalten():
     df = pd.DataFrame(all_data, columns=["Region", "Title", "Subtitle/Author", "Price", "Product-URL"])
     df = df.drop_duplicates(subset=["Region", "Title", "Product-URL"])
     df["Scraped At"] = RUN_TIMESTAMP
-    df.to_csv("gestalten_preise.csv", index=False, encoding="utf-8-sig")
-    print("Fertig! Datei 'gestalten_preise.csv' wurde erstellt.")
+    df.to_csv(os.path.join(OUTPUT_DIR, f"{RUN_TIMESTAMP_FS}_gestalten_preise.csv"), index=False, encoding="utf-8-sig")
+    print(f"Fertig! Datei '{RUN_TIMESTAMP_FS}_gestalten_preise.csv' wurde erstellt.")
 
     region_map = {"EU": "Italy", "UK": "UK", "US": "US"}
     rows = []
@@ -446,19 +452,150 @@ def run_gestalten():
 
 
 # ============================================================
+#  EXCHANGE RATES (ECB)
+# ============================================================
+
+def fetch_ecb_rates():
+    """Fetches latest EUR exchange rates from the ECB.
+    Returns dict: how many units of foreign currency per 1 EUR.
+    E.g. {"EUR": 1.0, "USD": 1.09, "GBP": 0.86, "JPY": 163.0}
+    """
+    url = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml"
+    try:
+        resp = requests.get(url, timeout=10)
+        root = ET.fromstring(resp.text)
+        ns_cube = "{http://www.ecb.int/vocabulary/2002-08-01/eurofxref}Cube"
+        rates = {"EUR": 1.0}
+        for cube in root.iter(ns_cube):
+            if "currency" in cube.attrib and "rate" in cube.attrib:
+                rates[cube.attrib["currency"]] = float(cube.attrib["rate"])
+        print(f"[OK] ECB rates: USD={rates.get('USD')}, GBP={rates.get('GBP')}, JPY={rates.get('JPY')}")
+        return rates
+    except Exception as e:
+        print(f"[WARNING] Could not fetch ECB rates: {e}. Using fallback values.")
+        return {"EUR": 1.0, "USD": 1.09, "GBP": 0.86, "JPY": 163.0}
+
+
+# ============================================================
+#  PRICE PARSING
+# ============================================================
+
+def parse_price(price_str):
+    """Extracts the first numeric price and returns it as a float, or None.
+    Handles strings like "Sale price$45.00Regular price$60.00" by taking
+    the first price found (= the sale/current price).
+    """
+    if not price_str or str(price_str).strip() in ("-", "N/A", ""):
+        return None
+    s = str(price_str)
+
+    # Try leading currency symbol first: "$45.00", "€1.500,00", "¥7,000"
+    match = re.search(r'[€$£¥￥]\s*([\d][0-9,\.]*)', s)
+    if not match:
+        # Try trailing currency symbol: "45,00 €", "40.00 GBP"
+        match = re.search(r'([\d][0-9,\.]*)\s*[€$£¥￥]', s)
+
+    if match:
+        s = match.group(1)
+    else:
+        # No symbol — strip known currency codes, then take the first number
+        s = re.sub(r'\b(EUR|USD|GBP|JPY|CHF)\b', '', s, flags=re.IGNORECASE)
+        first = re.search(r'[\d][0-9,\.]*', s)
+        s = first.group(0) if first else ''
+
+    if not s:
+        return None
+    try:
+        if ',' in s and '.' in s:
+            if s.rfind(',') > s.rfind('.'):
+                s = s.replace('.', '').replace(',', '.')
+            else:
+                s = s.replace(',', '')
+        elif ',' in s:
+            parts = s.split(',')
+            if len(parts) == 2 and len(parts[-1]) == 2:
+                s = s.replace(',', '.')
+            else:
+                s = s.replace(',', '')
+        return float(s)
+    except ValueError:
+        return None
+
+
+# ============================================================
 #  COMBINE & SAVE TOTAL FILES
 # ============================================================
 
+# Fallback: which currency is used in each market
+_MARKET_CURRENCY = {
+    "Italy": "EUR",
+    "US":    "USD",
+    "UK":    "GBP",
+    "Japan": "JPY",
+}
+
+def detect_currency(price_str, market):
+    """Detect currency from the price string (symbol/code).
+    Falls back to market mapping if no symbol is found.
+    This handles cases like Taschen Japan which displays USD prices.
+    """
+    if price_str:
+        s = str(price_str)
+        if '€' in s or re.search(r'\bEUR\b', s, re.IGNORECASE):
+            return 'EUR'
+        if '£' in s or re.search(r'\bGBP\b', s, re.IGNORECASE):
+            return 'GBP'
+        if '¥' in s or '￥' in s or re.search(r'\bJPY\b', s, re.IGNORECASE):
+            return 'JPY'
+        if '$' in s or re.search(r'\bUSD\b', s, re.IGNORECASE):
+            return 'USD'
+    return _MARKET_CURRENCY.get(market, 'EUR')
+
 def save_total(erg_rows, taschen_rows, assouline_rows, gestalten_rows):
-    columns = ["Source", "Market", "Title", "Price", "Subtitle/Author", "ISBN", "Product-ID", "Product-URL", "Scraped At"]
+    rates = fetch_ecb_rates()
+
+    columns = [
+        "Source", "Market", "Title", "Subtitle/Author", "ISBN", "Product-ID", "Product-URL",
+        "Price EUR", "Price USD", "Price GBP", "Price JPY", "Price EUR (converted)",
+        "Scraped At",
+    ]
+
     all_rows = erg_rows + taschen_rows + assouline_rows + gestalten_rows
-    df = pd.DataFrame(all_rows, columns=columns)
+    records = []
 
-    df.to_csv("total_prices.csv", index=False, encoding="utf-8-sig")
-    print("\nFertig! Datei 'total_prices.csv' wurde erstellt.")
+    for row in all_rows:
+        currency = detect_currency(row.get("Price"), row["Market"])
+        numeric = parse_price(row.get("Price"))
 
-    df.to_excel("total_prices.xlsx", index=False)
-    print("Fertig! Datei 'total_prices.xlsx' wurde erstellt.")
+        if numeric is not None:
+            rate = rates.get(currency, 1.0)
+            eur_converted = round(numeric / rate, 2)
+        else:
+            eur_converted = None
+
+        records.append({
+            "Source":              row["Source"],
+            "Market":              row["Market"],
+            "Title":               row["Title"],
+            "Subtitle/Author":     row.get("Subtitle/Author", ""),
+            "ISBN":                row.get("ISBN", ""),
+            "Product-ID":          row.get("Product-ID", ""),
+            "Product-URL":         row.get("Product-URL", ""),
+            "Price EUR":           numeric if currency == "EUR" else None,
+            "Price USD":           numeric if currency == "USD" else None,
+            "Price GBP":           numeric if currency == "GBP" else None,
+            "Price JPY":           numeric if currency == "JPY" else None,
+            "Price EUR (converted)": eur_converted,
+            "Scraped At":          row["Scraped At"],
+        })
+
+    df = pd.DataFrame(records, columns=columns)
+
+    df.to_csv(os.path.join(OUTPUT_DIR, f"{RUN_TIMESTAMP_FS}_total_prices.csv"), index=False, encoding="utf-8-sig")
+    print(f"\nFertig! Datei '{RUN_TIMESTAMP_FS}_total_prices.csv' wurde erstellt.")
+
+    df.to_excel(os.path.join(OUTPUT_DIR, f"{RUN_TIMESTAMP_FS}_total_prices.xlsx"), index=False)
+    print(f"Fertig! Datei '{RUN_TIMESTAMP_FS}_total_prices.xlsx' wurde erstellt.")
 
 
 # ============================================================
@@ -466,7 +603,9 @@ def save_total(erg_rows, taschen_rows, assouline_rows, gestalten_rows):
 # ============================================================
 
 async def main():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
     print(f"\nScrape-Run gestartet: {RUN_TIMESTAMP}")
+    print(f"Output-Ordner: {OUTPUT_DIR}")
 
     erg_rows = await run_erg()
     taschen_rows = await run_taschen()
@@ -478,13 +617,14 @@ async def main():
     print("\n" + "="*50)
     print("ALLE SCRAPERS FERTIG")
     print(f"Timestamp: {RUN_TIMESTAMP}")
+    print(f"Output-Ordner: {OUTPUT_DIR}/")
     print("Erstellte Dateien:")
-    print("  - erg_media_prices.csv")
-    print("  - taschen_preise.csv")
-    print("  - assouline2_preise.csv")
-    print("  - gestalten_preise.csv")
-    print("  - total_prices.csv")
-    print("  - total_prices.xlsx")
+    print(f"  - {RUN_TIMESTAMP_FS}_erg_media_prices.csv")
+    print(f"  - {RUN_TIMESTAMP_FS}_taschen_preise.csv")
+    print(f"  - {RUN_TIMESTAMP_FS}_assouline2_preise.csv")
+    print(f"  - {RUN_TIMESTAMP_FS}_gestalten_preise.csv")
+    print(f"  - {RUN_TIMESTAMP_FS}_total_prices.csv")
+    print(f"  - {RUN_TIMESTAMP_FS}_total_prices.xlsx")
     print("="*50)
 
 if __name__ == "__main__":
